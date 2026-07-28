@@ -12,6 +12,16 @@ from langchain_core.messages import HumanMessage
 
 logger = logging.getLogger("app.agent_service")
 
+# Groq's on-demand tier caps llama-3.3-70b-versatile at 12,000 tokens/minute.
+# These bounds keep the Stage 3 synthesis prompt (instructions + clause text +
+# web search snippets) comfortably under that limit even for contracts that
+# trigger all risk categories.
+TAVILY_SNIPPET_MAX_CHARS = 250
+MAX_CLAUSE_CHARS = 900
+MAX_CONTEXT_CLAUSES = 25
+MAX_SEARCH_QUERIES = 5
+TOKEN_LIMIT_ERROR_MARKERS = ("413", "rate_limit_exceeded", "tokens per minute", "request too large")
+
 # 1. Structured Output Schemas using Pydantic
 class RiskItem(BaseModel):
     category: str = Field(description="Risk category (Termination, Liability, IP Ownership, Indemnity, Jurisdiction, Other)")
@@ -69,6 +79,10 @@ class TavilySearchClient:
                         title = res.get("title", "No Title")
                         url_link = res.get("url", "")
                         desc = res.get("content", "No description available.")
+                        # Cap snippet length so N search results don't blow up the
+                        # Stage 3 synthesis prompt token count.
+                        if len(desc) > TAVILY_SNIPPET_MAX_CHARS:
+                            desc = desc[:TAVILY_SNIPPET_MAX_CHARS] + "..."
                         snippets.append(f"[{idx+1}] Source: {url_link}\nTitle: {title}\nSnippet: {desc}")
                     
                     return "\n\n".join(snippets)
@@ -314,7 +328,9 @@ async def run_contract_audit(document_id: str) -> Dict[str, Any]:
         if chunk_key not in seen_c_keys:
             seen_c_keys.add(chunk_key)
             context_clauses.append(chunk)
-            
+            if len(context_clauses) >= MAX_CONTEXT_CLAUSES:
+                break
+
     if not context_clauses:
         # Fallback to all chunks
         cursor = chunks_collection.find({"document_id": ObjectId(document_id)})
@@ -323,26 +339,35 @@ async def run_contract_audit(document_id: str) -> Dict[str, Any]:
             if chunk_key not in seen_c_keys:
                 seen_c_keys.add(chunk_key)
                 context_clauses.append(chunk)
-                
-    context_str = ""
-    for idx, c in enumerate(context_clauses):
-        page = c.get("metadata", {}).get("page_number", "Unknown") if "metadata" in c else c.get("page_number", "Unknown")
-        ref = c.get("clause_reference", "N/A")
-        cat = c.get("category", "General")
-        context_str += f"--- Clause Option {idx + 1} (Page {page}) [Ref: {ref}, Category: {cat}] ---\n{c['text']}\n\n"
+                if len(context_clauses) >= MAX_CONTEXT_CLAUSES:
+                    break
+
+    def _build_context_str(clauses: List[Dict[str, Any]], max_clause_chars: int = MAX_CLAUSE_CHARS) -> str:
+        parts = []
+        for idx, c in enumerate(clauses):
+            page = c.get("metadata", {}).get("page_number", "Unknown") if "metadata" in c else c.get("page_number", "Unknown")
+            ref = c.get("clause_reference", "N/A")
+            cat = c.get("category", "General")
+            text = c["text"]
+            if len(text) > max_clause_chars:
+                text = text[:max_clause_chars] + "..."
+            parts.append(f"--- Clause Option {idx + 1} (Page {page}) [Ref: {ref}, Category: {cat}] ---\n{text}\n\n")
+        return "".join(parts)
+
+    context_str = _build_context_str(context_clauses)
         
     # --- STAGE 2: Execute Web Search in Parallel ---
     web_context_str = ""
     if search_queries and settings.TAVILY_API_KEY:
         logger.info("Executing Stage 2: Performing parallel Tavily Web Searches...")
-        print(f"[LEGAL EAGLE] Stage 2: Running parallel Tavily Web Search queries for {min(len(search_queries), 8)} categories...")
+        print(f"[LEGAL EAGLE] Stage 2: Running parallel Tavily Web Search queries for {min(len(search_queries), MAX_SEARCH_QUERIES)} categories...")
         tavily_semaphore = asyncio.Semaphore(4)
 
         async def bounded_search(query: str):
             async with tavily_semaphore:
                 return await TavilySearchClient.search(query)
 
-        queries_executed = search_queries[:8]  # Limit to top 8 categories to protect API rate limits
+        queries_executed = search_queries[:MAX_SEARCH_QUERIES]  # Limit categories to protect API rate limits and Stage 3 prompt size
         search_results = await asyncio.gather(*[bounded_search(q) for q in queries_executed])
 
         for idx, res_text in enumerate(search_results):
@@ -353,8 +378,9 @@ async def run_contract_audit(document_id: str) -> Dict[str, Any]:
         
     # --- STAGE 3: Final Synthesis & Scoring ---
     logger.info("Executing Stage 3: LLM Synthesis and Compliance Audit Compilation...")
-    
-    stage2_prompt = f"""IMPORTANT: This document may contain many risky clauses.
+
+    def _build_stage3_prompt(context_block: str, web_block: str) -> str:
+        return f"""IMPORTANT: This document may contain many risky clauses.
 You MUST scan ALL clauses before stopping.
 Do not stop after finding 5 risks.
 Minimum 8 risks must be evaluated for any HIGH RISK document.
@@ -486,17 +512,37 @@ You must respond ONLY with a valid JSON document matching the following keys:
 }}
 
 Contract Clauses:
-{context_str}
+{context_block}
 
 Web Search Precedents & Legal Context:
-{web_context_str}
+{web_block}
 
 Respond strictly in the JSON format above, with no markdown formatting, no introductory text, and no concluding words. Must be a clean JSON document."""
 
     print("[LEGAL EAGLE] Stage 3: Synthesizing search results and compiling final audit report...")
     chat = get_llm_client(temperature=0.1)
-    response_stage2 = await chat.ainvoke([HumanMessage(content=stage2_prompt)])
-    
+    stage2_prompt = _build_stage3_prompt(context_str, web_context_str)
+
+    try:
+        response_stage2 = await chat.ainvoke([HumanMessage(content=stage2_prompt)])
+    except Exception as synth_err:
+        if any(marker in str(synth_err).lower() for marker in TOKEN_LIMIT_ERROR_MARKERS):
+            # Provider rejected the request for exceeding its tokens-per-minute quota.
+            # Retry once with a much smaller prompt (fewer/shorter clauses, no web
+            # search context) rather than dropping the audit entirely.
+            logger.warning(
+                f"Stage 3 synthesis hit a provider token limit ({synth_err}); retrying with a reduced prompt."
+            )
+            print("[LEGAL EAGLE] Stage 3 prompt exceeded provider token limits. Retrying with reduced context...")
+            reduced_context_str = _build_context_str(context_clauses[:10], max_clause_chars=400)
+            reduced_prompt = _build_stage3_prompt(
+                reduced_context_str,
+                "Web search context omitted to stay within provider token limits."
+            )
+            response_stage2 = await chat.ainvoke([HumanMessage(content=reduced_prompt)])
+        else:
+            raise
+
     try:
         final_audit_data = clean_json_response(response_stage2.content)
         
