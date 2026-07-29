@@ -115,6 +115,18 @@ def get_llm_client(temperature: float = 0.1, json_mode: bool = False):
         raise ValueError(f"Unsupported LLM provider: {settings.LLM_PROVIDER}")
 
 
+def get_structured_llm_client(schema, temperature: float = 0.1):
+    """
+    Returns an LLM client bound to a Pydantic schema via LangChain's structured
+    output support. The provider's JSON response is parsed and validated
+    against `schema` before it's ever handed back to the caller - a malformed
+    or incomplete response raises instead of silently returning an unvalidated
+    dict, unlike hand-rolled JSON scraping.
+    """
+    base_client = get_llm_client(temperature=temperature, json_mode=False)
+    return base_client.with_structured_output(schema, method="json_mode")
+
+
 async def generate_document_summary(whole_document: str) -> str:
     """
     Generates a brief high-level summary of the overall document using the selected provider.

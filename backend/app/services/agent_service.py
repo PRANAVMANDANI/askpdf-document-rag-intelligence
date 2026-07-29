@@ -1,4 +1,3 @@
-import json
 import asyncio
 import logging
 import httpx
@@ -7,7 +6,7 @@ from bson import ObjectId
 from pydantic import BaseModel, Field
 from app.config import settings
 from app.database import Database
-from app.services.llm_service import get_llm_client
+from app.services.llm_service import get_structured_llm_client
 from langchain_core.messages import HumanMessage
 
 logger = logging.getLogger("app.agent_service")
@@ -36,6 +35,13 @@ class ContractAuditReport(BaseModel):
     overall_score: int = Field(description="Safety score from 0 (very risky) to 100 (perfectly safe)")
     summary: str = Field(description="A brief 2-3 sentence overall summary of the contract's risk profile")
     risks: List[RiskItem] = Field(default=[], description="List of identified risk items")
+
+
+class DocumentClassification(BaseModel):
+    document_type: str = Field(description="One of CONTRACT, GOVERNMENT_FORM, POLICY_DOCUMENT, FINANCIAL_DOC, INFORMATIONAL, OTHER")
+    confidence: float = Field(description="Classifier confidence between 0 and 1")
+    reason: str = Field(description="Brief justification for the classification")
+    proceed_with_analysis: bool = Field(description="True only if document_type is CONTRACT")
 
 
 # 2. Tavily Search Client Integration
@@ -98,28 +104,6 @@ class TavilySearchClient:
 
 
 
-# 3. Clean JSON Output Parser
-def clean_json_response(text: str) -> Dict[str, Any]:
-    """
-    Cleans markdown formatting and extracts a raw JSON string to load as a dictionary.
-    """
-    text_clean = text.strip()
-    if text_clean.startswith("```"):
-        lines = text_clean.split("\n")
-        if lines[0].startswith("```json"):
-            text_clean = "\n".join(lines[1:-1])
-        elif lines[0].startswith("```"):
-            text_clean = "\n".join(lines[1:-1])
-    
-    # Strip any potential leading/trailing non-json noise
-    start_idx = text_clean.find("{")
-    end_idx = text_clean.rfind("}")
-    if start_idx != -1 and end_idx != -1:
-        text_clean = text_clean[start_idx:end_idx + 1]
-        
-    return json.loads(text_clean)
-
-
 CLASSIFIER_SYSTEM_PROMPT = """You are a document type classifier. Your ONLY job is to 
 determine whether the uploaded document is a legal contract 
 or agreement that requires risk analysis.
@@ -179,11 +163,10 @@ Classify this document:
 
 {preview}
 """
-    chat = get_llm_client(temperature=0.1)
+    chat_structured = get_structured_llm_client(DocumentClassification, temperature=0.1)
     try:
-        response = await chat.ainvoke([HumanMessage(content=prompt)])
-        result = clean_json_response(response.content)
-        return result
+        result = await chat_structured.ainvoke([HumanMessage(content=prompt)])
+        return result.model_dump()
     except Exception as e:
         logger.error(f"Error during document classification: {e}")
         # If JSON parse fails, default to safe — don't analyze
@@ -520,32 +503,35 @@ Web Search Precedents & Legal Context:
 Respond strictly in the JSON format above, with no markdown formatting, no introductory text, and no concluding words. Must be a clean JSON document."""
 
     print("[LEGAL EAGLE] Stage 3: Synthesizing search results and compiling final audit report...")
-    chat = get_llm_client(temperature=0.1)
+    chat_structured = get_structured_llm_client(ContractAuditReport, temperature=0.1)
     stage2_prompt = _build_stage3_prompt(context_str, web_context_str)
 
     try:
-        response_stage2 = await chat.ainvoke([HumanMessage(content=stage2_prompt)])
-    except Exception as synth_err:
-        if any(marker in str(synth_err).lower() for marker in TOKEN_LIMIT_ERROR_MARKERS):
-            # Provider rejected the request for exceeding its tokens-per-minute quota.
-            # Retry once with a much smaller prompt (fewer/shorter clauses, no web
-            # search context) rather than dropping the audit entirely.
-            logger.warning(
-                f"Stage 3 synthesis hit a provider token limit ({synth_err}); retrying with a reduced prompt."
-            )
-            print("[LEGAL EAGLE] Stage 3 prompt exceeded provider token limits. Retrying with reduced context...")
-            reduced_context_str = _build_context_str(context_clauses[:10], max_clause_chars=400)
-            reduced_prompt = _build_stage3_prompt(
-                reduced_context_str,
-                "Web search context omitted to stay within provider token limits."
-            )
-            response_stage2 = await chat.ainvoke([HumanMessage(content=reduced_prompt)])
-        else:
-            raise
+        try:
+            result_stage2 = await chat_structured.ainvoke([HumanMessage(content=stage2_prompt)])
+        except Exception as synth_err:
+            if any(marker in str(synth_err).lower() for marker in TOKEN_LIMIT_ERROR_MARKERS):
+                # Provider rejected the request for exceeding its tokens-per-minute quota.
+                # Retry once with a much smaller prompt (fewer/shorter clauses, no web
+                # search context) rather than dropping the audit entirely.
+                logger.warning(
+                    f"Stage 3 synthesis hit a provider token limit ({synth_err}); retrying with a reduced prompt."
+                )
+                print("[LEGAL EAGLE] Stage 3 prompt exceeded provider token limits. Retrying with reduced context...")
+                reduced_context_str = _build_context_str(context_clauses[:10], max_clause_chars=400)
+                reduced_prompt = _build_stage3_prompt(
+                    reduced_context_str,
+                    "Web search context omitted to stay within provider token limits."
+                )
+                result_stage2 = await chat_structured.ainvoke([HumanMessage(content=reduced_prompt)])
+            else:
+                raise
 
-    try:
-        final_audit_data = clean_json_response(response_stage2.content)
-        
+        # result_stage2 is already validated against ContractAuditReport by
+        # with_structured_output - a malformed/incomplete LLM response would
+        # have raised above rather than reaching this line.
+        final_audit_data = result_stage2.model_dump()
+
         # Validate and sanitize overall score
         score = final_audit_data.get("overall_score", 100)
         try:
@@ -567,7 +553,7 @@ Respond strictly in the JSON format above, with no markdown formatting, no intro
         return final_audit_data
         
     except Exception as parse_err2:
-        logger.error(f"Failed to parse Stage 3 final audit JSON: {parse_err2}. Content: {response_stage2.content}")
+        logger.error(f"Failed to obtain a valid Stage 3 audit report: {parse_err2}")
         # Return fallback audit structure
         return {
             "overall_score": 50,
